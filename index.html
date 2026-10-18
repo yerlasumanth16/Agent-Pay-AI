@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      (function () {
+        try {
+          var currentFetch = window.fetch ? window.fetch.bind(window) : undefined;
+          Object.defineProperty(window, 'fetch', {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+              return currentFetch;
+            },
+            set: function (nextFetch) {
+              if (typeof nextFetch === 'function') {
+                currentFetch = nextFetch;
+              }
+            },
+          });
+        } catch (_err) {
+          // Ignore if environment locks property redefinition
+        }
+
+        window.addEventListener(
+          'error',
+          function (event) {
+            if (
+              (event.filename && event.filename.indexOf('chrome-extension://') === 0) ||
+              (event.message &&
+                event.message.indexOf('Cannot set property fetch of #<Window>') !== -1)
+            ) {
+              event.stopImmediatePropagation();
+              event.preventDefault();
+            }
+          },
+          true
+        );
+      })();
+    </script>
+    <title>AgentPay AI — Describe it. Watch it happen. Approve it. Done.</title>
+    <meta name="description" content="Describe it. Watch it happen. Approve it. Done. An AI-powered browser automation and purchase approval workspace." />
+    <meta property="og:title" content="AgentPay AI — Describe it. Watch it happen. Approve it. Done." />
+    <meta property="og:description" content="Describe it. Watch it happen. Approve it. Done. An AI-powered browser automation and purchase approval workspace." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700&display=swap" rel="stylesheet" />
+  </head>
+  <body class="bg-[#0B0D11] text-[#E6E8EE] antialiased selection:bg-indigo-500/30 selection:text-indigo-200 overflow-x-hidden">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

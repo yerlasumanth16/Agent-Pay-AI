@@ -1,0 +1,6 @@
+{
+  "name": "AgentPay AI",
+  "description": "Describe it. Watch it happen. Approve it. Done. An AI-powered browser automation and purchase approval workspace.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
