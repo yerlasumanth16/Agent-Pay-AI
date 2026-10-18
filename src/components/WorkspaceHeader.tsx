@@ -1,11 +1,11 @@
 import React from 'react';
 import { Menu, PanelRight, Settings } from 'lucide-react';
-import { TaskExecutionState } from '../types/agentpay';
 import { ManagedBrowserSessionInfo } from '../types/browserHealth';
 
 interface WorkspaceHeaderProps {
   taskTitle: string | null;
-  agentRuntimeStatus: TaskExecutionState;
+  agentRuntimeStatusLabel: string;
+  isGeminiConfigured: boolean;
   browserSession: ManagedBrowserSessionInfo;
   isBrowserPanelOpen: boolean;
   onToggleBrowserPanel: () => void;
@@ -15,7 +15,8 @@ interface WorkspaceHeaderProps {
 
 export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
   taskTitle,
-  agentRuntimeStatus,
+  agentRuntimeStatusLabel,
+  isGeminiConfigured,
   browserSession,
   isBrowserPanelOpen,
   onToggleBrowserPanel,
@@ -53,7 +54,13 @@ export const WorkspaceHeader: React.FC<WorkspaceHeaderProps> = ({
       {/* Right: Honest Status Labels & Panel Controls */}
       <div className="flex items-center gap-3 shrink-0">
         <div className="hidden md:flex items-center gap-2.5 text-xs text-neutral-400 whitespace-nowrap">
-          <span>{agentRuntimeStatus}</span>
+          <span
+            className={
+              isGeminiConfigured ? 'text-neutral-200' : 'text-neutral-400'
+            }
+          >
+            {agentRuntimeStatusLabel}
+          </span>
           <span aria-hidden="true" className="text-white/20">
             ·
           </span>

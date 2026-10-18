@@ -2,6 +2,15 @@ import {
   BrowserHealthCheckResult,
   ManagedBrowserSessionInfo,
 } from '../types/browserHealth';
+import {
+  BrowserActionRequest,
+  BrowserActionResponse,
+} from '../types/browserActions';
+import {
+  AgentChatRequest,
+  AgentChatResponse,
+  AgentRuntimeStatusResponse,
+} from '../types/agentpay';
 
 let cachedToken: string | null = null;
 let tokenExpiresAt = 0;
@@ -36,37 +45,42 @@ async function getWorkspaceToken(forceRefresh = false): Promise<string> {
 
 async function authorizedRequest<T>(
   path: string,
-  method: 'GET' | 'POST'
+  method: 'GET' | 'POST',
+  bodyPayload?: unknown,
+  allowStructuredErrorResponse = false
 ): Promise<T> {
   let token = await getWorkspaceToken(false);
 
-  let res = await fetch(path, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-AgentPay-Client': 'workspace-v2',
-      Authorization: `Bearer ${token}`,
-    },
-    body: method === 'POST' ? JSON.stringify({}) : undefined,
-  });
-
-  if (res.status === 401 || res.status === 403) {
-    token = await getWorkspaceToken(true);
-    res = await fetch(path, {
+  const makeFetch = (bearer: string) =>
+    fetch(path, {
       method,
       headers: {
         'Content-Type': 'application/json',
         'X-AgentPay-Client': 'workspace-v2',
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${bearer}`,
       },
-      body: method === 'POST' ? JSON.stringify({}) : undefined,
+      body:
+        method === 'POST' ? JSON.stringify(bodyPayload ?? {}) : undefined,
     });
+
+  let res = await makeFetch(token);
+
+  if (res.status === 401 || (res.status === 403 && !allowStructuredErrorResponse)) {
+    token = await getWorkspaceToken(true);
+    res = await makeFetch(token);
+  } else if (res.status === 403 && allowStructuredErrorResponse) {
+    const clone = res.clone();
+    const bodyJson = await clone.json().catch(() => null);
+    if (bodyJson && typeof bodyJson.error === 'string' && bodyJson.error.includes('token')) {
+      token = await getWorkspaceToken(true);
+      res = await makeFetch(token);
+    }
   }
 
-  if (!res.ok) {
+  if (!res.ok && !allowStructuredErrorResponse) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(
-      errData.error || `Browser request failed (HTTP ${res.status})`
+      errData.error || `Request failed (HTTP ${res.status})`
     );
   }
 
@@ -98,6 +112,35 @@ export async function closeBrowserSession(): Promise<ManagedBrowserSessionInfo> 
   return authorizedRequest<ManagedBrowserSessionInfo>(
     '/api/browser/session/close',
     'POST'
+  );
+}
+
+export async function sendBrowserAction(
+  payload: BrowserActionRequest
+): Promise<BrowserActionResponse> {
+  return authorizedRequest<BrowserActionResponse>(
+    '/api/browser/session/action',
+    'POST',
+    payload,
+    true
+  );
+}
+
+export async function fetchAgentRuntimeStatus(): Promise<AgentRuntimeStatusResponse> {
+  return authorizedRequest<AgentRuntimeStatusResponse>(
+    '/api/agent/status',
+    'GET'
+  );
+}
+
+export async function sendAgentChatMessage(
+  payload: AgentChatRequest
+): Promise<AgentChatResponse> {
+  return authorizedRequest<AgentChatResponse>(
+    '/api/agent/chat',
+    'POST',
+    payload,
+    true
   );
 }
 

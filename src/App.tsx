@@ -1,11 +1,23 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
-import { TaskRecord } from './types/agentpay';
+import {
+  AgentRuntimeStatusResponse,
+  ConversationHistoryTurn,
+  TaskEvent,
+  TaskRecord,
+} from './types/agentpay';
 import { ManagedBrowserSessionInfo } from './types/browserHealth';
+import {
+  BrowserActionRequest,
+  BrowserActionResponse,
+} from './types/browserActions';
 import {
   fetchBrowserSessionStatus,
   startBrowserSession,
   refreshBrowserScreenshot,
   closeBrowserSession,
+  sendBrowserAction,
+  fetchAgentRuntimeStatus,
+  sendAgentChatMessage,
 } from './services/browserSessionClient';
 import { Sidebar } from './components/Sidebar';
 import { WorkspaceHeader } from './components/WorkspaceHeader';
@@ -38,10 +50,19 @@ const INITIAL_BROWSER_SESSION: ManagedBrowserSessionInfo = {
   errorMessage: null,
 };
 
+const INITIAL_AGENT_RUNTIME: AgentRuntimeStatusResponse = {
+  configured: false,
+  model: 'gemini-3.1-flash-lite',
+  statusLabel: 'Checking AI runtime...',
+  toolDeclarationsCount: 0,
+  registeredTools: [],
+};
+
 export default function App() {
   // Genuine user-submitted tasks only (never seeded with fictional tasks)
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+  const [isProcessingPrompt, setIsProcessingPrompt] = useState(false);
 
   // Prompt composer state
   const [composerValue, setComposerValue] = useState('');
@@ -52,14 +73,38 @@ export default function App() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
+  // Real Server-Side Gemini Runtime Status
+  const [agentRuntime, setAgentRuntime] =
+    useState<AgentRuntimeStatusResponse>(INITIAL_AGENT_RUNTIME);
+
   // Real Server-Side Playwright Browser Session State
   const [browserSession, setBrowserSession] =
     useState<ManagedBrowserSessionInfo>(INITIAL_BROWSER_SESSION);
+  const [isExecutingAction, setIsExecutingAction] = useState(false);
+  const [lastActionResponse, setLastActionResponse] =
+    useState<BrowserActionResponse | null>(null);
   const isBrowserRequestInFlightRef = useRef(false);
 
-  // Check actual server-side browser session status on mount
+  // Check actual server-side Gemini & Playwright browser session statuses on mount
   useEffect(() => {
     let mounted = true;
+
+    fetchAgentRuntimeStatus()
+      .then((runtimeStatus) => {
+        if (!mounted) return;
+        setAgentRuntime(runtimeStatus);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setAgentRuntime({
+          configured: false,
+          model: 'gemini-3.1-flash-lite',
+          statusLabel: 'AI runtime unreachable',
+          toolDeclarationsCount: 0,
+          registeredTools: [],
+        });
+      });
+
     fetchBrowserSessionStatus()
       .then((status) => {
         if (!mounted) return;
@@ -71,6 +116,7 @@ export default function App() {
       .catch(() => {
         // Keep initial disconnected state if unreachable
       });
+
     return () => {
       mounted = false;
     };
@@ -113,24 +159,26 @@ export default function App() {
     setComposerFocusTrigger((c) => c + 1);
   }, []);
 
-  // Submit a natural-language task (Honest non-simulated handling)
+  // Submit a natural-language prompt to the server-side Gemini function-calling endpoint
   const handleSubmitPrompt = useCallback(
-    (promptText: string) => {
-      const now = getCurrentTimeStr();
-      const unavailableNotice =
-        'Agent runtime is not connected. Your instruction has been saved to this session, but automated task execution is not yet connected to an AI backend.';
+    async (promptText: string) => {
+      if (isProcessingPrompt) return;
 
-      if (!activeTaskId) {
-        const newId = `task-${Date.now()}`;
+      const now = getCurrentTimeStr();
+      let targetTaskId = activeTaskId;
+      let priorHistory: ConversationHistoryTurn[] = [];
+
+      if (!targetTaskId) {
+        targetTaskId = `task-${Date.now()}`;
         const shortTitle =
           promptText.length > 48 ? `${promptText.slice(0, 48)}...` : promptText;
 
         const newTask: TaskRecord = {
-          id: newId,
+          id: targetTaskId,
           title: shortTitle,
           prompt: promptText,
           createdAt: now,
-          state: 'Agent runtime not connected',
+          state: 'Task running',
           messages: [
             {
               id: `msg-u-${Date.now()}`,
@@ -138,31 +186,40 @@ export default function App() {
               content: promptText,
               timestamp: now,
             },
-            {
-              id: `msg-s-${Date.now() + 1}`,
-              role: 'system',
-              content: unavailableNotice,
-              timestamp: now,
-            },
           ],
           events: [
             {
               id: `ev-${Date.now()}`,
               timestamp: now,
-              description: 'Task recorded. Agent runtime not connected.',
-              status: 'error',
+              description: 'Sent prompt to server-side Gemini API.',
+              status: 'info',
             },
           ],
         };
 
         setTasks((prev) => [newTask, ...prev]);
-        setActiveTaskId(newId);
+        setActiveTaskId(targetTaskId);
       } else {
+        const existingTask = tasks.find((t) => t.id === targetTaskId);
+        if (existingTask) {
+          priorHistory = existingTask.messages
+            .filter(
+              (m) =>
+                (m.role === 'user' || m.role === 'assistant') && !m.isError
+            )
+            .map((m) => ({
+              role: m.role === 'user' ? 'user' : 'model',
+              content: m.content,
+            }));
+        }
+
         setTasks((prev) =>
           prev.map((task) => {
-            if (task.id !== activeTaskId) return task;
+            if (task.id !== targetTaskId) return task;
             return {
               ...task,
+              state: 'Task running',
+              errorMessage: undefined,
               messages: [
                 ...task.messages,
                 {
@@ -171,21 +228,14 @@ export default function App() {
                   content: promptText,
                   timestamp: now,
                 },
-                {
-                  id: `msg-s-${Date.now() + 1}`,
-                  role: 'system',
-                  content: unavailableNotice,
-                  timestamp: now,
-                },
               ],
               events: [
                 ...task.events,
                 {
                   id: `ev-${Date.now()}`,
                   timestamp: now,
-                  description:
-                    'Follow-up instruction recorded. Agent runtime not connected.',
-                  status: 'error',
+                  description: 'Sent follow-up prompt to server-side Gemini API.',
+                  status: 'info',
                 },
               ],
             };
@@ -194,8 +244,146 @@ export default function App() {
       }
 
       setComposerValue('');
+      setIsProcessingPrompt(true);
+
+      try {
+        const response = await sendAgentChatMessage({
+          message: promptText,
+          history: priorHistory,
+        });
+
+        const replyTime = getCurrentTimeStr();
+
+        if (response.browserSession) {
+          setBrowserSession(response.browserSession);
+        }
+
+        if (response.success && response.reply) {
+          const newEvents: TaskEvent[] = [];
+
+          if (response.toolExecution) {
+            newEvents.push({
+              id: `ev-${Date.now()}-tool-req`,
+              timestamp: response.timestamp || replyTime,
+              description: `${response.toolExecution.statusLabel} (${response.toolExecution.toolName})`,
+              status: 'info',
+            });
+            newEvents.push({
+              id: `ev-${Date.now()}-tool-res`,
+              timestamp: response.timestamp || replyTime,
+              description: response.toolExecution.summary,
+              status: response.toolExecution.toolSuccess ? 'info' : 'error',
+            });
+          }
+
+          newEvents.push({
+            id: `ev-${Date.now()}-ok`,
+            timestamp: response.timestamp || replyTime,
+            description: `Received response from Gemini (${response.model}) in ${response.durationMs}ms.`,
+            status: 'info',
+          });
+
+          const nextTaskState = response.toolExecution?.approvalRequired
+            ? 'Waiting for approval'
+            : 'Completed';
+
+          setTasks((prev) =>
+            prev.map((task) => {
+              if (task.id !== targetTaskId) return task;
+              return {
+                ...task,
+                state: nextTaskState,
+                errorMessage: undefined,
+                messages: [
+                  ...task.messages,
+                  {
+                    id: `msg-a-${Date.now()}`,
+                    role: 'assistant',
+                    content: response.reply || '',
+                    timestamp: response.timestamp || replyTime,
+                    model: response.model,
+                    toolExecution: response.toolExecution || null,
+                  },
+                ],
+                events: [...task.events, ...newEvents],
+              };
+            })
+          );
+        } else {
+          const errMsg =
+            response.error?.message ||
+            'Gemini returned an error while processing your request.';
+          setTasks((prev) =>
+            prev.map((task) => {
+              if (task.id !== targetTaskId) return task;
+              return {
+                ...task,
+                state: 'Failed',
+                errorMessage: errMsg,
+                messages: [
+                  ...task.messages,
+                  {
+                    id: `msg-err-${Date.now()}`,
+                    role: 'system',
+                    content: errMsg,
+                    timestamp: response.timestamp || replyTime,
+                    isError: true,
+                  },
+                ],
+                events: [
+                  ...task.events,
+                  {
+                    id: `ev-${Date.now()}-err`,
+                    timestamp: response.timestamp || replyTime,
+                    description: errMsg,
+                    status: 'error',
+                  },
+                ],
+              };
+            })
+          );
+        }
+      } catch (err: unknown) {
+        const errMsg =
+          err instanceof Error
+            ? err.message
+            : 'Failed to reach server-side Gemini endpoint.';
+        const errTime = getCurrentTimeStr();
+
+        setTasks((prev) =>
+          prev.map((task) => {
+            if (task.id !== targetTaskId) return task;
+            return {
+              ...task,
+              state: 'Failed',
+              errorMessage: errMsg,
+              messages: [
+                ...task.messages,
+                {
+                  id: `msg-err-${Date.now()}`,
+                  role: 'system',
+                  content: errMsg,
+                  timestamp: errTime,
+                  isError: true,
+                },
+              ],
+              events: [
+                ...task.events,
+                {
+                  id: `ev-${Date.now()}-err`,
+                  timestamp: errTime,
+                  description: errMsg,
+                  status: 'error',
+                },
+              ],
+            };
+          })
+        );
+      } finally {
+        setIsProcessingPrompt(false);
+      }
     },
-    [activeTaskId]
+    [activeTaskId, isProcessingPrompt, tasks]
   );
 
   // Real Browser Session Controls (Connected to server-side Playwright)
@@ -212,6 +400,7 @@ export default function App() {
     try {
       const updated = await startBrowserSession();
       setBrowserSession(updated);
+      setLastActionResponse(null);
       if (updated.connected && activeTaskId) {
         appendTaskEvent(
           activeTaskId,
@@ -289,6 +478,7 @@ export default function App() {
     try {
       const updated = await closeBrowserSession();
       setBrowserSession(updated);
+      setLastActionResponse(null);
       if (activeTaskId) {
         appendTaskEvent(activeTaskId, 'Browser session closed.', 'info');
       }
@@ -308,6 +498,81 @@ export default function App() {
     }
   }, [activeTaskId, appendTaskEvent]);
 
+  // Execute a real, bounded Playwright browser action on the active session
+  const handleExecuteBrowserAction = useCallback(
+    async (request: BrowserActionRequest) => {
+      if (isBrowserRequestInFlightRef.current) return;
+      isBrowserRequestInFlightRef.current = true;
+      setIsExecutingAction(true);
+
+      try {
+        const response = await sendBrowserAction(request);
+        setLastActionResponse(response);
+        if (response.session) {
+          setBrowserSession(response.session);
+        }
+
+        if (activeTaskId) {
+          if (response.success) {
+            appendTaskEvent(
+              activeTaskId,
+              `Browser action "${response.action}" verified on ${
+                response.currentUrl || 'active page'
+              }.`,
+              'info'
+            );
+          } else if (response.error) {
+            appendTaskEvent(
+              activeTaskId,
+              `Browser action "${response.action}" stopped (${response.error.code}): ${response.error.message}`,
+              'error'
+            );
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setLastActionResponse({
+          success: false,
+          action: request.action,
+          sessionId: browserSession.sessionId,
+          result: null,
+          pageTitle: browserSession.pageTitle,
+          currentUrl: browserSession.currentUrl,
+          screenshotDataUrl: browserSession.screenshotDataUrl,
+          timestamp: getCurrentTimeStr(),
+          error: {
+            code: 'ACTION_EXECUTION_FAILED',
+            message: msg,
+          },
+        });
+        if (activeTaskId) {
+          appendTaskEvent(activeTaskId, msg, 'error');
+        }
+      } finally {
+        setIsExecutingAction(false);
+        isBrowserRequestInFlightRef.current = false;
+      }
+    },
+    [activeTaskId, appendTaskEvent, browserSession]
+  );
+
+  const handleApproveOriginFromChat = useCallback(
+    async (origin: string) => {
+      await handleExecuteBrowserAction({
+        action: 'navigate',
+        url: origin,
+        approveOrigin: true,
+      });
+    },
+    [handleExecuteBrowserAction]
+  );
+
+  const headerStatusLabel = useMemo(() => {
+    if (isProcessingPrompt) return 'Processing request...';
+    if (activeTask) return activeTask.state;
+    return agentRuntime.statusLabel;
+  }, [activeTask, agentRuntime.statusLabel, isProcessingPrompt]);
+
   return (
     <div className="h-screen w-screen overflow-hidden flex bg-[#0B0D11] text-[#E6E8EE]">
       {/* A. Slim Left Sidebar */}
@@ -326,9 +591,8 @@ export default function App() {
         {/* D. Small Top Toolbar */}
         <WorkspaceHeader
           taskTitle={activeTask ? activeTask.title : null}
-          agentRuntimeStatus={
-            activeTask ? activeTask.state : 'Agent runtime not connected'
-          }
+          agentRuntimeStatusLabel={headerStatusLabel}
+          isGeminiConfigured={agentRuntime.configured}
           browserSession={browserSession}
           isBrowserPanelOpen={isBrowserPanelOpen}
           onToggleBrowserPanel={() => setIsBrowserPanelOpen((prev) => !prev)}
@@ -344,9 +608,11 @@ export default function App() {
               composerValue={composerValue}
               onComposerChange={setComposerValue}
               onSubmitPrompt={handleSubmitPrompt}
+              isProcessingPrompt={isProcessingPrompt}
               autoFocusTrigger={composerFocusTrigger}
               onOpenBrowserPanel={() => setIsBrowserPanelOpen(true)}
               isBrowserConnected={browserSession.connected}
+              onApproveOriginFromChat={handleApproveOriginFromChat}
             />
           </main>
 
@@ -355,9 +621,12 @@ export default function App() {
             <div className="hidden lg:block w-[420px] xl:w-[460px] h-full shrink-0">
               <BrowserPanel
                 session={browserSession}
+                isExecutingAction={isExecutingAction}
+                lastActionResponse={lastActionResponse}
                 onStartBrowser={handleStartBrowser}
                 onRefreshScreenshot={handleRefreshScreenshot}
                 onCloseBrowser={handleCloseBrowser}
+                onExecuteAction={handleExecuteBrowserAction}
                 onCollapsePanel={() => setIsBrowserPanelOpen(false)}
               />
             </div>
@@ -374,9 +643,12 @@ export default function App() {
               <div className="relative z-10 w-full max-w-md h-full">
                 <BrowserPanel
                   session={browserSession}
+                  isExecutingAction={isExecutingAction}
+                  lastActionResponse={lastActionResponse}
                   onStartBrowser={handleStartBrowser}
                   onRefreshScreenshot={handleRefreshScreenshot}
                   onCloseBrowser={handleCloseBrowser}
+                  onExecuteAction={handleExecuteBrowserAction}
                   onCollapsePanel={() => setIsBrowserPanelOpen(false)}
                 />
               </div>
@@ -421,6 +693,7 @@ export default function App() {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         browserSession={browserSession}
+        agentRuntime={agentRuntime}
       />
     </div>
   );

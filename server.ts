@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
@@ -8,6 +9,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import type { BlockerCategory, BrowserHealthCheckResult } from './src/types/browserHealth.js';
 import { browserSessionManager } from './src/server/browserSessionManager.js';
+import { executeBrowserAction } from './src/server/browserActionService.js';
+import {
+  getAgentRuntimeStatus,
+  handleAgentChatRequest,
+} from './src/server/geminiService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +27,7 @@ const TOKEN_TTL_MS = 1000 * 60 * 30; // 30 minutes
 // Concurrency & rate-limiting state for one-shot health check and session operations
 let isHealthCheckRunning = false;
 const recentCheckTimestamps: number[] = [];
-const MAX_CHECKS_PER_MINUTE = 30;
+const MAX_CHECKS_PER_MINUTE = 120;
 
 function cleanupExpiredTokens() {
   const now = Date.now();
@@ -193,7 +199,7 @@ async function startServer() {
     res.json({ token, expiresInMs: TOKEN_TTL_MS });
   });
 
-  // 2. Harmless, fixed, local test page served directly by this application
+  // 2. Harmless, fixed, local verification page served directly by this application
   app.get('/api/browser/local-test-page', (_req: Request, res: Response) => {
     const serverTime = new Date().toLocaleTimeString();
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -205,24 +211,24 @@ async function startServer() {
     <style>
       body {
         margin: 0;
-        padding: 28px;
+        padding: 24px;
         background: #0B0D11;
         color: #E6E8EE;
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       }
       .card {
-        max-width: 800px;
-        margin: 0 auto;
+        max-width: 820px;
+        margin: 0 auto 24px auto;
         background: #121722;
         border: 1px solid #2A3246;
         border-radius: 12px;
-        padding: 26px;
+        padding: 22px;
       }
       .top-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 14px;
+        margin-bottom: 12px;
       }
       .badge {
         display: inline-block;
@@ -240,14 +246,19 @@ async function startServer() {
         color: #A5B4FC;
       }
       h1 {
-        margin: 0 0 10px 0;
-        font-size: 22px;
+        margin: 0 0 8px 0;
+        font-size: 20px;
         color: #FFFFFF;
       }
-      p {
-        margin: 0 0 18px 0;
+      h2 {
+        margin: 16px 0 8px 0;
         font-size: 14px;
-        line-height: 1.6;
+        color: #CBD5E1;
+      }
+      p {
+        margin: 0 0 14px 0;
+        font-size: 13px;
+        line-height: 1.5;
         color: #94A3B8;
       }
       .grid {
@@ -255,7 +266,7 @@ async function startServer() {
         grid-template-columns: repeat(3, 1fr);
         gap: 12px;
         border-top: 1px solid #1E2638;
-        padding-top: 16px;
+        padding-top: 14px;
         font-family: monospace;
         font-size: 12px;
       }
@@ -266,6 +277,71 @@ async function startServer() {
       .cell-val {
         color: #E2E8F0;
         font-weight: 600;
+      }
+      .controls {
+        margin-top: 16px;
+        padding-top: 14px;
+        border-top: 1px solid #1E2638;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: flex-end;
+        gap: 12px;
+      }
+      .field-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      label {
+        font-size: 12px;
+        color: #CBD5E1;
+      }
+      input[type="text"] {
+        background: #0B0D11;
+        border: 1px solid #334155;
+        color: #F8FAFC;
+        padding: 6px 10px;
+        border-radius: 6px;
+        font-size: 13px;
+        width: 220px;
+      }
+      button {
+        background: #1E293B;
+        border: 1px solid #475569;
+        color: #F8FAFC;
+        padding: 6px 12px;
+        border-radius: 6px;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      button.consequential {
+        background: rgba(244, 63, 94, 0.15);
+        border-color: rgba(244, 63, 94, 0.4);
+        color: #FDA4AF;
+      }
+      .status-box {
+        margin-top: 12px;
+        padding: 8px 12px;
+        background: #0B0D11;
+        border: 1px solid #1E293B;
+        border-radius: 6px;
+        font-family: monospace;
+        font-size: 12px;
+        color: #38BDF8;
+      }
+      a {
+        color: #818CF8;
+        font-size: 12px;
+        text-decoration: underline;
+      }
+      .scroll-spacer {
+        max-width: 820px;
+        margin: 0 auto;
+        padding: 20px;
+        background: #0E121B;
+        border: 1px solid #1E2638;
+        border-radius: 12px;
+        height: 520px;
       }
     </style>
   </head>
@@ -293,9 +369,123 @@ async function startServer() {
           <div class="cell-val" id="verification-time">${serverTime}</div>
         </div>
       </div>
+
+      <h2>Interactive Verification Controls</h2>
+      <div class="controls">
+        <div class="field-group">
+          <label for="verification-input">Verification Query</label>
+          <input
+            id="verification-input"
+            name="verificationQuery"
+            type="text"
+            placeholder="Enter verification text"
+            value=""
+          />
+        </div>
+        <button type="button" id="apply-verification-btn">Apply Verification</button>
+        <button
+          type="button"
+          id="consequential-pay-btn"
+          class="consequential"
+          data-consequential="true"
+        >
+          Complete Purchase &amp; Submit Payment
+        </button>
+        <a href="/api/browser/local-test-page-2" id="subpage-link">Open Verification Subpage</a>
+      </div>
+
+      <div class="status-box">
+        INTERACTION STATE: <span id="interaction-output">Idle</span>
+      </div>
+    </div>
+
+    <div class="scroll-spacer">
+      <h2>Extended Scroll Region</h2>
+      <p>Lower verification section used to validate deterministic vertical scroll operations.</p>
+    </div>
+
+    <script>
+      (function () {
+        var input = document.getElementById('verification-input');
+        var applyBtn = document.getElementById('apply-verification-btn');
+        var payBtn = document.getElementById('consequential-pay-btn');
+        var output = document.getElementById('interaction-output');
+
+        if (applyBtn && input && output) {
+          applyBtn.addEventListener('click', function () {
+            output.textContent = 'Applied: ' + (input.value || '(empty)');
+          });
+          input.addEventListener('keydown', function (ev) {
+            if (ev.key === 'Enter') {
+              ev.preventDefault();
+              output.textContent = 'Enter key submitted: ' + (input.value || '(empty)');
+            }
+          });
+        }
+        if (payBtn && output) {
+          payBtn.addEventListener('click', function () {
+            output.textContent = 'UNAPPROVED_PAYMENT_EXECUTED';
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>`);
+  });
+
+  // 2b. Secondary internal verification route for navigation testing
+  app.get('/api/browser/local-test-page-2', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AgentPay AI — Secondary Verification Target</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 28px;
+        background: #0B0D11;
+        color: #E6E8EE;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      .card {
+        max-width: 760px;
+        margin: 0 auto;
+        background: #121722;
+        border: 1px solid #2A3246;
+        border-radius: 12px;
+        padding: 24px;
+      }
+      h1 {
+        margin: 0 0 10px 0;
+        font-size: 20px;
+        color: #FFFFFF;
+      }
+      p {
+        color: #94A3B8;
+        font-size: 13px;
+      }
+      a {
+        color: #818CF8;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1 id="verification-heading">Secondary Verification Target</h1>
+      <p id="verification-summary">Navigation to the secondary controlled verification route succeeded.</p>
+      <p id="interaction-output">Secondary page active</p>
+      <a href="/api/browser/local-test-page">Return to Primary Verification Target</a>
     </div>
   </body>
 </html>`);
+  });
+
+  // 2c. Internal test route that attempts an unauthorized redirect to an internal endpoint
+  app.get('/api/browser/local-test-redirect-private', (_req: Request, res: Response) => {
+    res.redirect(302, `http://127.0.0.1:${PORT}/api/browser/session-token`);
   });
 
   // 3. Managed Playwright Browser Session Endpoints (Phase 2, Step 2)
@@ -336,6 +526,36 @@ async function startServer() {
       if (!checkRateLimit(res)) return;
       const status = await browserSessionManager.closeSession();
       res.json(status);
+    }
+  );
+
+  // 3b. Bounded Playwright Browser Action Endpoint (Phase 2, Step 2.3)
+  app.post(
+    '/api/browser/session/action',
+    requireWorkspaceAuth,
+    async (req: Request, res: Response) => {
+      if (!checkRateLimit(res)) return;
+      const outcome = await executeBrowserAction(req.body);
+      res.status(outcome.httpStatus).json(outcome.body);
+    }
+  );
+
+  // 3c. Server-Side Gemini Agent Status & Chat Endpoints (Phase 3, Step 3.1)
+  app.get(
+    '/api/agent/status',
+    requireWorkspaceAuth,
+    (_req: Request, res: Response) => {
+      res.json(getAgentRuntimeStatus());
+    }
+  );
+
+  app.post(
+    '/api/agent/chat',
+    requireWorkspaceAuth,
+    async (req: Request, res: Response) => {
+      if (!checkRateLimit(res)) return;
+      const outcome = await handleAgentChatRequest(req.body);
+      res.status(outcome.httpStatus).json(outcome.body);
     }
   );
 

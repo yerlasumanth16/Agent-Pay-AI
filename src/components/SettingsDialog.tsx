@@ -1,18 +1,21 @@
 import React, { useEffect } from 'react';
 import { X } from 'lucide-react';
 import { ManagedBrowserSessionInfo } from '../types/browserHealth';
+import { AgentRuntimeStatusResponse } from '../types/agentpay';
 import { DeveloperDiagnostics } from './DeveloperDiagnostics';
 
 interface SettingsDialogProps {
   isOpen: boolean;
   onClose: () => void;
   browserSession: ManagedBrowserSessionInfo;
+  agentRuntime: AgentRuntimeStatusResponse;
 }
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   isOpen,
   onClose,
   browserSession,
+  agentRuntime,
 }) => {
   useEffect(() => {
     if (!isOpen) return;
@@ -58,8 +61,14 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           <div className="divide-y divide-white/[0.06]">
             <div className="py-2.5 first:pt-0 flex items-center justify-between gap-4">
               <span className="text-neutral-400">AI runtime status</span>
-              <span className="font-mono text-neutral-200">
-                Agent runtime not connected
+              <span
+                className={`font-mono ${
+                  agentRuntime.configured
+                    ? 'text-emerald-300'
+                    : 'text-neutral-200'
+                }`}
+              >
+                {agentRuntime.statusLabel}
               </span>
             </div>
 
