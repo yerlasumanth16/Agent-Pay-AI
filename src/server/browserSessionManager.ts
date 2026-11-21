@@ -5,6 +5,8 @@ import type {
   ManagedBrowserState,
 } from '../types/browserHealth.js';
 
+const PORT = Number(process.env.PORT) || 3000;
+export const DEFAULT_LOCAL_TARGET_URL = `http://127.0.0.1:${PORT}/api/browser/local-test-page`;
 const IDLE_TIMEOUT_MS = 1000 * 60 * 15; // 15 minutes max idle time
 
 export interface ActivePlaywrightSession {
@@ -271,7 +273,7 @@ class PlaywrightSessionManager {
     return this.buildSnapshot();
   }
 
-  public async getStatus(): Promise<ManagedBrowserSessionInfo> {
+  public async getStatusUnlocked(): Promise<ManagedBrowserSessionInfo> {
     if (!this.isTransitioning) {
       if (this.browser || this.page) {
         if (!this.isLive()) {
@@ -294,110 +296,144 @@ class PlaywrightSessionManager {
     return this.buildSnapshot();
   }
 
+  public async getStatus(): Promise<ManagedBrowserSessionInfo> {
+    return this.runExclusive(async () => {
+      return this.getStatusUnlocked();
+    });
+  }
+
+  /**
+   * Internal session launcher to be called from within `runExclusive`.
+   * If a live session already exists, refreshes its screenshot and returns it.
+   */
+  public async startSessionUnlocked(
+    fixedTargetUrl: string = DEFAULT_LOCAL_TARGET_URL
+  ): Promise<ManagedBrowserSessionInfo> {
+    if (this.isLive() && this.page) {
+      return this.captureScreenshotInternal();
+    }
+
+    this.isTransitioning = true;
+    this.state = 'Starting';
+    this.errorMessage = null;
+    this.lastUpdatedAt = new Date().toLocaleTimeString();
+
+    try {
+      await this.forceCleanup();
+
+      const browser = await chromium.launch({
+        headless: true,
+        timeout: 15000,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+        ],
+      });
+
+      const context = await browser.newContext({
+        viewport: { width: 880, height: 460 },
+      });
+
+      const page = await context.newPage();
+
+      // Attach unexpected disconnect/close listeners
+      browser.on('disconnected', () => {
+        if (!this.isTransitioning && this.state === 'Connected') {
+          this.resetMetadataToDisconnected(
+            'Chromium browser process disconnected unexpectedly.'
+          );
+        }
+      });
+
+      await page.goto(fixedTargetUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 10000,
+      });
+
+      const nowStr = new Date().toLocaleTimeString();
+      const sessionId = `sess-${crypto.randomBytes(4).toString('hex')}`;
+
+      // Stamp session metadata into the live test page DOM before screenshot
+      await page.evaluate(
+        ({ sid, frameNum, capturedAt }) => {
+          const timeEl = document.getElementById('verification-time');
+          if (timeEl) {
+            timeEl.textContent = `${capturedAt} (Frame #${frameNum})`;
+          }
+          const sessionEl = document.getElementById('verification-session');
+          if (sessionEl) {
+            sessionEl.textContent = sid;
+          }
+        },
+        { sid: sessionId, frameNum: 1, capturedAt: nowStr }
+      );
+
+      const pageTitle = await page.title();
+      const heading = await page
+        .locator('#verification-heading')
+        .textContent({ timeout: 1500 })
+        .catch(() => null);
+      const summary = await page
+        .locator('#verification-summary')
+        .textContent({ timeout: 1500 })
+        .catch(() => null);
+      const screenshotBuf = await page.screenshot({
+        type: 'png',
+        fullPage: false,
+      });
+
+      this.browser = browser;
+      this.context = context;
+      this.page = page;
+      this.sessionId = sessionId;
+      this.browserVersion = browser.version();
+      this.currentUrl = page.url();
+      this.pageTitle = pageTitle;
+      this.extractedHeading = heading ? heading.trim() : null;
+      this.extractedSummary = summary ? summary.trim() : null;
+      this.screenshotDataUrl = `data:image/png;base64,${screenshotBuf.toString(
+        'base64'
+      )}`;
+      this.screenshotCount = 1;
+      this.startedAt = nowStr;
+      this.lastUpdatedAt = nowStr;
+      this.lastScreenshotAt = nowStr;
+      this.state = 'Connected';
+      this.errorMessage = null;
+
+      this.resetIdleTimer();
+    } catch (err: unknown) {
+      await this.forceCleanup();
+      this.resetMetadataToDisconnected(
+        `Failed to start Chromium session: ${this.sanitizeError(err)}`
+      );
+    } finally {
+      this.isTransitioning = false;
+    }
+
+    return this.buildSnapshot();
+  }
+
+  /**
+   * Ensures an active Chromium session is running before executing a browser action.
+   * Must be called inside `runExclusive`.
+   */
+  public async ensureSessionUnlocked(
+    fixedTargetUrl: string = DEFAULT_LOCAL_TARGET_URL
+  ): Promise<ManagedBrowserSessionInfo> {
+    if (this.isLive() && this.page) {
+      return this.buildSnapshot();
+    }
+    return this.startSessionUnlocked(fixedTargetUrl);
+  }
+
   public async startSession(
-    fixedTargetUrl: string
+    fixedTargetUrl: string = DEFAULT_LOCAL_TARGET_URL
   ): Promise<ManagedBrowserSessionInfo> {
     return this.runExclusive(async () => {
-      // If an active, healthy session already exists, refresh its screenshot and return it
-      if (this.isLive() && this.page) {
-        return this.captureScreenshotInternal();
-      }
-
-      this.isTransitioning = true;
-      this.state = 'Starting';
-      this.errorMessage = null;
-      this.lastUpdatedAt = new Date().toLocaleTimeString();
-
-      try {
-        await this.forceCleanup();
-
-        const browser = await chromium.launch({
-          headless: true,
-          timeout: 15000,
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-          ],
-        });
-
-        const context = await browser.newContext({
-          viewport: { width: 880, height: 460 },
-        });
-
-        const page = await context.newPage();
-
-        // Attach unexpected disconnect/close listeners
-        browser.on('disconnected', () => {
-          if (!this.isTransitioning && this.state === 'Connected') {
-            this.resetMetadataToDisconnected(
-              'Chromium browser process disconnected unexpectedly.'
-            );
-          }
-        });
-
-        await page.goto(fixedTargetUrl, {
-          waitUntil: 'domcontentloaded',
-          timeout: 10000,
-        });
-
-        const nowStr = new Date().toLocaleTimeString();
-        const sessionId = `sess-${crypto.randomBytes(4).toString('hex')}`;
-
-        // Stamp session metadata into the live test page DOM before screenshot
-        await page.evaluate(
-          ({ sid, frameNum, capturedAt }) => {
-            const timeEl = document.getElementById('verification-time');
-            if (timeEl) {
-              timeEl.textContent = `${capturedAt} (Frame #${frameNum})`;
-            }
-            const sessionEl = document.getElementById('verification-session');
-            if (sessionEl) {
-              sessionEl.textContent = sid;
-            }
-          },
-          { sid: sessionId, frameNum: 1, capturedAt: nowStr }
-        );
-
-        const pageTitle = await page.title();
-        const heading = await page.locator('#verification-heading').textContent();
-        const summary = await page.locator('#verification-summary').textContent();
-        const screenshotBuf = await page.screenshot({
-          type: 'png',
-          fullPage: false,
-        });
-
-        this.browser = browser;
-        this.context = context;
-        this.page = page;
-        this.sessionId = sessionId;
-        this.browserVersion = browser.version();
-        this.currentUrl = page.url();
-        this.pageTitle = pageTitle;
-        this.extractedHeading = heading ? heading.trim() : null;
-        this.extractedSummary = summary ? summary.trim() : null;
-        this.screenshotDataUrl = `data:image/png;base64,${screenshotBuf.toString(
-          'base64'
-        )}`;
-        this.screenshotCount = 1;
-        this.startedAt = nowStr;
-        this.lastUpdatedAt = nowStr;
-        this.lastScreenshotAt = nowStr;
-        this.state = 'Connected';
-        this.errorMessage = null;
-
-        this.resetIdleTimer();
-      } catch (err: unknown) {
-        await this.forceCleanup();
-        this.resetMetadataToDisconnected(
-          `Failed to start Chromium session: ${this.sanitizeError(err)}`
-        );
-      } finally {
-        this.isTransitioning = false;
-      }
-
-      return this.buildSnapshot();
+      return this.startSessionUnlocked(fixedTargetUrl);
     });
   }
 

@@ -1274,7 +1274,8 @@ async function performInspectPage(page: Page): Promise<PageInspectionResult> {
 }
 
 export async function executeBrowserAction(
-  rawBody: unknown
+  rawBody: unknown,
+  options?: { autoStartSession?: boolean }
 ): Promise<ActionExecutionResult> {
   // 1. Validate payload structure & parameters first
   const validation = validateActionRequest(rawBody);
@@ -1298,31 +1299,162 @@ export async function executeBrowserAction(
   }
 
   const request = validation.request;
+  const shouldAutoStart = options?.autoStartSession !== false;
 
   // 2. Serialize execution against the single managed Playwright session
   return browserSessionManager.runExclusive(async () => {
-    const active = browserSessionManager.getActiveSession();
-    if (!active) {
+    // Pre-validate navigation URLs and consequential/sensitive targets before auto-launching Chromium
+    let preValidatedNavUrl: URL | null = null;
+    if (request.action === 'navigate') {
+      const urlCheck = await validateNavigationUrl(request.url, {
+        approveOrigin: request.approveOrigin,
+      });
+      if (!urlCheck.valid) {
+        const snapshot = browserSessionManager.buildSnapshot();
+        return {
+          httpStatus: urlCheck.httpStatus,
+          body: {
+            success: false,
+            action: 'navigate',
+            sessionId: snapshot.sessionId,
+            result: null,
+            pageTitle: snapshot.pageTitle,
+            currentUrl: snapshot.currentUrl,
+            screenshotDataUrl: snapshot.screenshotDataUrl,
+            timestamp: getTimestamp(),
+            approvalRequired: urlCheck.approvalRequired,
+            pendingOrigin: urlCheck.pendingOrigin,
+            error: urlCheck.error,
+            session: snapshot,
+          },
+        };
+      }
+      preValidatedNavUrl = urlCheck.parsedUrl;
+    } else if (
+      request.action === 'click' &&
+      isConsequentialText(request.target.value)
+    ) {
       const snapshot = browserSessionManager.buildSnapshot();
       return {
-        httpStatus: 409,
+        httpStatus: 403,
         body: {
           success: false,
-          action: request.action,
-          sessionId: null,
+          action: 'click',
+          sessionId: snapshot.sessionId,
           result: null,
-          pageTitle: null,
-          currentUrl: null,
-          screenshotDataUrl: null,
+          pageTitle: snapshot.pageTitle,
+          currentUrl: snapshot.currentUrl,
+          screenshotDataUrl: snapshot.screenshotDataUrl,
           timestamp: getTimestamp(),
+          approvalRequired: true,
           error: {
-            code: 'NO_ACTIVE_SESSION',
-            message:
-              'Cannot execute browser action: No active Chromium session is connected. Start a browser session first.',
+            code: 'CONSEQUENTIAL_ACTION_BLOCKED',
+            message: `Consequential action blocked: Clicking "${request.target.value}" requires explicit human approval before execution.`,
           },
           session: snapshot,
         },
       };
+    } else if (
+      request.action === 'fill' &&
+      isSensitiveInputDescriptor(request.target.value)
+    ) {
+      const snapshot = browserSessionManager.buildSnapshot();
+      return {
+        httpStatus: 403,
+        body: {
+          success: false,
+          action: 'fill',
+          sessionId: snapshot.sessionId,
+          result: null,
+          pageTitle: snapshot.pageTitle,
+          currentUrl: snapshot.currentUrl,
+          screenshotDataUrl: snapshot.screenshotDataUrl,
+          timestamp: getTimestamp(),
+          approvalRequired: true,
+          error: {
+            code: 'CONSEQUENTIAL_ACTION_BLOCKED',
+            message: `Consequential action blocked: Filling payment or credential field "${request.target.value}" is restricted and requires explicit human approval.`,
+          },
+          session: snapshot,
+        },
+      };
+    } else if (
+      request.action === 'pressKey' &&
+      request.target &&
+      isConsequentialText(request.target.value)
+    ) {
+      const snapshot = browserSessionManager.buildSnapshot();
+      return {
+        httpStatus: 403,
+        body: {
+          success: false,
+          action: 'pressKey',
+          sessionId: snapshot.sessionId,
+          result: null,
+          pageTitle: snapshot.pageTitle,
+          currentUrl: snapshot.currentUrl,
+          screenshotDataUrl: snapshot.screenshotDataUrl,
+          timestamp: getTimestamp(),
+          approvalRequired: true,
+          error: {
+            code: 'CONSEQUENTIAL_ACTION_BLOCKED',
+            message: `Consequential action blocked: Keyboard interaction on "${request.target.value}" requires human approval.`,
+          },
+          session: snapshot,
+        },
+      };
+    }
+
+    let active = browserSessionManager.getActiveSession();
+    if (!active) {
+      if (!shouldAutoStart) {
+        const snapshot = browserSessionManager.buildSnapshot();
+        return {
+          httpStatus: 409,
+          body: {
+            success: false,
+            action: request.action,
+            sessionId: null,
+            result: null,
+            pageTitle: null,
+            currentUrl: null,
+            screenshotDataUrl: null,
+            timestamp: getTimestamp(),
+            error: {
+              code: 'NO_ACTIVE_SESSION',
+              message:
+                'Cannot execute browser action: No active Chromium session is connected. Start a browser session first.',
+            },
+            session: snapshot,
+          },
+        };
+      }
+
+      // Automatically start the managed Chromium session when a valid browser task is requested
+      const startedSnapshot = await browserSessionManager.ensureSessionUnlocked();
+      active = browserSessionManager.getActiveSession();
+      if (!active) {
+        return {
+          httpStatus: 500,
+          body: {
+            success: false,
+            action: request.action,
+            sessionId: null,
+            result: null,
+            pageTitle: null,
+            currentUrl: null,
+            screenshotDataUrl: null,
+            timestamp: getTimestamp(),
+            error: {
+              code: 'ACTION_EXECUTION_FAILED',
+              message:
+                startedSnapshot.errorMessage ||
+                'Failed to automatically launch Chromium browser session.',
+            },
+            session: startedSnapshot,
+          },
+        };
+      }
     }
 
     const { page, sessionId } = active;
@@ -1330,32 +1462,11 @@ export async function executeBrowserAction(
     try {
       switch (request.action) {
         case 'navigate': {
-          const urlCheck = await validateNavigationUrl(request.url, {
-            approveOrigin: request.approveOrigin,
-          });
-          if (!urlCheck.valid) {
-            const snapshot = browserSessionManager.buildSnapshot();
-            return {
-              httpStatus: urlCheck.httpStatus,
-              body: {
-                success: false,
-                action: 'navigate',
-                sessionId,
-                result: null,
-                pageTitle: snapshot.pageTitle,
-                currentUrl: snapshot.currentUrl,
-                screenshotDataUrl: snapshot.screenshotDataUrl,
-                timestamp: getTimestamp(),
-                approvalRequired: urlCheck.approvalRequired,
-                pendingOrigin: urlCheck.pendingOrigin,
-                error: urlCheck.error,
-                session: snapshot,
-              },
-            };
-          }
+          const targetUrlString = preValidatedNavUrl
+            ? preValidatedNavUrl.toString()
+            : request.url;
 
           const previousSafeUrl = page.url();
-          const targetUrlString = urlCheck.parsedUrl.toString();
 
           const response = await page.goto(targetUrlString, {
             waitUntil: 'domcontentloaded',
@@ -1441,7 +1552,7 @@ export async function executeBrowserAction(
           const inspection = await performInspectPage(page);
           const updatedSnapshot =
             await browserSessionManager.syncStateFromActivePage({
-              captureScreenshot: false,
+              captureScreenshot: true,
             });
 
           return {

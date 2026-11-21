@@ -51,7 +51,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
 
   const handleRunAction = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isConnected || isExecutingAction) return;
+    if (isExecutingAction) return;
 
     switch (selectedAction) {
       case 'inspectPage':
@@ -123,6 +123,16 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
       ? (lastActionResponse.result as PageInspectionResult)
       : null;
 
+  const panelStatusLabel = isConnected
+    ? 'Browser connected'
+    : session.state === 'Starting'
+    ? 'Browser starting'
+    : session.state === 'Closing'
+    ? 'Browser closing'
+    : session.state === 'Capturing screenshot'
+    ? 'Capturing screenshot'
+    : 'Browser disconnected';
+
   return (
     <aside
       aria-label="Browser Preview"
@@ -143,7 +153,7 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({
             }`}
             data-testid="browser-panel-status"
           >
-            {isConnected ? 'Browser connected' : session.state}
+            {panelStatusLabel}
           </span>
         </div>
 

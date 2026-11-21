@@ -85,9 +85,21 @@ export default function App() {
     useState<BrowserActionResponse | null>(null);
   const isBrowserRequestInFlightRef = useRef(false);
 
-  // Check actual server-side Gemini & Playwright browser session statuses on mount
+  // Check actual server-side Gemini & Playwright browser session statuses on mount and keep synchronized
   useEffect(() => {
     let mounted = true;
+
+    const syncStatusFromServer = () => {
+      if (isBrowserRequestInFlightRef.current) return;
+      fetchBrowserSessionStatus()
+        .then((status) => {
+          if (!mounted || isBrowserRequestInFlightRef.current) return;
+          setBrowserSession(status);
+        })
+        .catch(() => {
+          // Keep current state if transiently unreachable
+        });
+    };
 
     fetchAgentRuntimeStatus()
       .then((runtimeStatus) => {
@@ -117,8 +129,21 @@ export default function App() {
         // Keep initial disconnected state if unreachable
       });
 
+    const handleVisibilityOrFocus = () => {
+      if (document.visibilityState === 'visible') {
+        syncStatusFromServer();
+      }
+    };
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    const intervalId = window.setInterval(syncStatusFromServer, 8000);
+
     return () => {
       mounted = false;
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.clearInterval(intervalId);
     };
   }, []);
 
@@ -256,6 +281,25 @@ export default function App() {
 
         if (response.browserSession) {
           setBrowserSession(response.browserSession);
+          // Automatically open the Browser Preview panel when a browser session is active and a browser tool ran
+          if (
+            response.browserSession.connected &&
+            response.toolExecution &&
+            response.toolExecution.toolName !== 'get_browser_status'
+          ) {
+            setIsBrowserPanelOpen(true);
+          } else if (
+            response.toolExecution &&
+            (response.toolExecution.toolName === 'start_browser' ||
+              response.toolExecution.screenshotCaptured ||
+              response.toolExecution.approvalRequired)
+          ) {
+            setIsBrowserPanelOpen(true);
+          }
+        } else {
+          fetchBrowserSessionStatus()
+            .then((status) => setBrowserSession(status))
+            .catch(() => {});
         }
 
         if (response.success && response.reply) {
@@ -350,6 +394,10 @@ export default function App() {
             : 'Failed to reach server-side Gemini endpoint.';
         const errTime = getCurrentTimeStr();
 
+        fetchBrowserSessionStatus()
+          .then((status) => setBrowserSession(status))
+          .catch(() => {});
+
         setTasks((prev) =>
           prev.map((task) => {
             if (task.id !== targetTaskId) return task;
@@ -390,6 +438,7 @@ export default function App() {
   const handleStartBrowser = useCallback(async () => {
     if (isBrowserRequestInFlightRef.current) return;
     isBrowserRequestInFlightRef.current = true;
+    setIsBrowserPanelOpen(true);
 
     setBrowserSession((prev) => ({
       ...prev,
@@ -431,6 +480,7 @@ export default function App() {
   const handleRefreshScreenshot = useCallback(async () => {
     if (isBrowserRequestInFlightRef.current) return;
     isBrowserRequestInFlightRef.current = true;
+    setIsBrowserPanelOpen(true);
 
     setBrowserSession((prev) => ({
       ...prev,
@@ -504,6 +554,7 @@ export default function App() {
       if (isBrowserRequestInFlightRef.current) return;
       isBrowserRequestInFlightRef.current = true;
       setIsExecutingAction(true);
+      setIsBrowserPanelOpen(true);
 
       try {
         const response = await sendBrowserAction(request);
@@ -558,6 +609,7 @@ export default function App() {
 
   const handleApproveOriginFromChat = useCallback(
     async (origin: string) => {
+      setIsBrowserPanelOpen(true);
       await handleExecuteBrowserAction({
         action: 'navigate',
         url: origin,

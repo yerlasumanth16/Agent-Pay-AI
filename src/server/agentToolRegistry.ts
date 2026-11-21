@@ -13,6 +13,7 @@ import type { AgentToolExecutionSummary } from '../types/agentpay.js';
 import type { ManagedBrowserSessionInfo } from '../types/browserHealth.js';
 
 export type RegisteredGeminiToolName =
+  | 'start_browser'
   | 'get_browser_status'
   | 'navigate_browser'
   | 'inspect_page'
@@ -24,6 +25,7 @@ export type RegisteredGeminiToolName =
 
 export const REGISTERED_TOOL_NAMES: ReadonlySet<RegisteredGeminiToolName> =
   new Set<RegisteredGeminiToolName>([
+    'start_browser',
     'get_browser_status',
     'navigate_browser',
     'inspect_page',
@@ -51,6 +53,7 @@ const ALLOWED_KEYS_BY_TOOL: Record<
   RegisteredGeminiToolName,
   ReadonlySet<string>
 > = {
+  start_browser: new Set(['url']),
   get_browser_status: new Set([]),
   inspect_page: new Set([]),
   capture_screenshot: new Set([]),
@@ -69,15 +72,31 @@ const ALLOWED_KEYS_BY_TOOL: Record<
 };
 
 /**
- * Restricted set of 8 Gemini function declarations for Phase 3, Step 3.2.
+ * Restricted set of 9 Gemini function declarations for AgentPay AI.
  * No shell commands, filesystem access, arbitrary JS evaluation, database admin,
  * payment capture, money transfer, or unapproved purchase tools exist.
  */
 export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
+    name: 'start_browser',
+    description:
+      'Start or open the server-side Playwright Chromium browser session and capture a live PNG screenshot. Optionally navigate to an initial validated HTTP/HTTPS URL.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        url: {
+          type: Type.STRING,
+          description:
+            'Optional full http:// or https:// URL to open after starting the browser. If omitted, opens the default local verification target.',
+        },
+      },
+      required: [],
+    },
+  },
+  {
     name: 'get_browser_status',
     description:
-      'Return the real status of the server-side Playwright Chromium session, including whether it is connected, the active session ID, current URL, and page title.',
+      'Return the real status of the server-side Playwright Chromium session, including whether it is connected, the active session ID, current URL, and page title. Use this only for read-only status checks.',
     parameters: {
       type: Type.OBJECT,
       properties: {},
@@ -87,7 +106,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'navigate_browser',
     description:
-      'Navigate the active server-side Chromium browser session to a validated HTTP or HTTPS URL. Loopback, private-network, and unapproved external origins are restricted by server policy.',
+      'Navigate the server-side Chromium browser session to a validated HTTP or HTTPS URL (automatically launching Chromium if currently disconnected). Loopback, private-network, and unapproved external origins are restricted by server policy.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -103,7 +122,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'inspect_page',
     description:
-      'Inspect the current page in the active Chromium browser session and return its real title, URL, headings, visible text excerpt, links, buttons, and labeled input fields.',
+      'Inspect the current page in the server-side Chromium browser session (automatically launching Chromium if currently disconnected) and return its real title, URL, headings, visible text excerpt, links, buttons, and labeled input fields.',
     parameters: {
       type: Type.OBJECT,
       properties: {},
@@ -113,7 +132,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'click_element',
     description:
-      'Click a visible, enabled element on the active page using an approved accessible locator strategy (role, label, placeholder, text, or testid). The server automatically enforces consequential-action approval checks before clicking.',
+      'Click a visible, enabled element on the active page using an approved accessible locator strategy (role, label, placeholder, text, or testid). Automatically starts Chromium if disconnected. The server automatically enforces consequential-action approval checks before clicking.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -161,7 +180,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'fill_input',
     description:
-      'Fill a permitted editable text input field on the active page using an approved accessible locator. Filling password, payment-card, CVV, or sensitive authentication fields is prohibited.',
+      'Fill a permitted editable text input field on the active page using an approved accessible locator (automatically starting Chromium if disconnected). Filling password, payment-card, CVV, or sensitive authentication fields is prohibited.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -198,7 +217,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'scroll_page',
     description:
-      'Scroll the active browser page vertically in a specified direction (up, down, top, or bottom).',
+      'Scroll the active browser page vertically in a specified direction (up, down, top, or bottom), automatically starting Chromium if disconnected.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -219,7 +238,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'press_key',
     description:
-      'Press a permitted keyboard key on the active browser page, optionally focusing an accessible target element first.',
+      'Press a permitted keyboard key on the active browser page (automatically starting Chromium if disconnected), optionally focusing an accessible target element first.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -277,7 +296,7 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'capture_screenshot',
     description:
-      'Capture a fresh PNG screenshot from the active server-side Chromium browser session.',
+      'Capture a fresh PNG screenshot from the server-side Chromium browser session (automatically starting Chromium if disconnected).',
     parameters: {
       type: Type.OBJECT,
       properties: {},
@@ -288,6 +307,8 @@ export const AGENT_BROWSER_TOOL_DECLARATIONS: FunctionDeclaration[] = [
 
 export function getToolStatusLabel(toolName: string): string {
   switch (toolName) {
+    case 'start_browser':
+      return 'Starting Chromium browser session';
     case 'get_browser_status':
       return 'Checking browser session status';
     case 'navigate_browser':
@@ -320,7 +341,7 @@ export function validateGeminiToolCall(
       valid: true;
       toolName: RegisteredGeminiToolName;
       sanitizedArgs: Record<string, unknown>;
-      mappedActionRequest: BrowserActionRequest | null; // null for get_browser_status
+      mappedActionRequest: BrowserActionRequest | null; // null for get_browser_status or default start_browser
     }
   | {
       valid: false;
@@ -398,6 +419,35 @@ export function validateGeminiToolCall(
       toolName: registeredName,
       sanitizedArgs: {},
       mappedActionRequest: null,
+    };
+  }
+
+  if (registeredName === 'start_browser') {
+    const rawUrl = argsObj.url;
+    if (rawUrl === undefined || rawUrl === null || String(rawUrl).trim() === '') {
+      return {
+        valid: true,
+        toolName: registeredName,
+        sanitizedArgs: {},
+        mappedActionRequest: null,
+      };
+    }
+    const checkedNav = validateActionRequest({
+      action: 'navigate',
+      url: rawUrl,
+    });
+    if (!checkedNav.valid) {
+      return {
+        valid: false,
+        sanitizedArgs: argsObj,
+        error: checkedNav.error,
+      };
+    }
+    return {
+      valid: true,
+      toolName: registeredName,
+      sanitizedArgs: { url: rawUrl },
+      mappedActionRequest: checkedNav.request,
     };
   }
 
@@ -547,7 +597,61 @@ export async function dispatchGeminiToolCall(
 
   const { toolName: validName, sanitizedArgs, mappedActionRequest } = validation;
 
-  // 1. Handle get_browser_status directly via browserSessionManager.getStatus()
+  // 1a. Handle start_browser (without custom URL) via browserSessionManager.startSession()
+  if (validName === 'start_browser' && !mappedActionRequest) {
+    const status = await browserSessionManager.startSession();
+    const startSuccess = status.connected;
+    const statusSummary = startSuccess
+      ? `Browser session started (${status.sessionId}) on "${
+          status.pageTitle || 'Untitled'
+        }" (${status.currentUrl || 'local target'}).`
+      : status.errorMessage || 'Failed to start Chromium browser session.';
+
+    const summary: AgentToolExecutionSummary = {
+      toolName: validName,
+      statusLabel,
+      args: sanitizedArgs,
+      executed: true,
+      toolSuccess: startSuccess,
+      sessionId: status.sessionId,
+      pageTitle: status.pageTitle,
+      currentUrl: status.currentUrl,
+      summary: statusSummary,
+      screenshotCaptured: Boolean(status.screenshotDataUrl),
+      skippedAdditionalTools,
+      ...(startSuccess
+        ? {}
+        : {
+            error: {
+              code: 'ACTION_EXECUTION_FAILED',
+              message: statusSummary,
+            },
+          }),
+    };
+
+    return {
+      summary,
+      modelResponsePayload: {
+        success: startSuccess,
+        action: 'start_browser',
+        connected: status.connected,
+        state: status.state,
+        sessionId: status.sessionId,
+        browserVersion: status.browserVersion,
+        currentUrl: status.currentUrl,
+        pageTitle: status.pageTitle,
+        mainHeading: status.extractedHeading,
+        summary: status.extractedSummary,
+        screenshotAvailable: Boolean(status.screenshotDataUrl),
+        screenshotCount: status.screenshotCount,
+        lastUpdatedAt: status.lastUpdatedAt,
+        errorMessage: status.errorMessage,
+      },
+      browserSession: status,
+    };
+  }
+
+  // 1b. Handle get_browser_status directly via browserSessionManager.getStatus()
   if (validName === 'get_browser_status' || !mappedActionRequest) {
     const status = await browserSessionManager.getStatus();
     const statusSummary = status.connected
@@ -590,8 +694,10 @@ export async function dispatchGeminiToolCall(
     };
   }
 
-  // 2. Execute browser action via executeBrowserAction on the active Playwright session
-  const actionOutcome = await executeBrowserAction(mappedActionRequest);
+  // 2. Execute browser action via executeBrowserAction (which auto-starts Chromium if disconnected)
+  const actionOutcome = await executeBrowserAction(mappedActionRequest, {
+    autoStartSession: true,
+  });
   const body = actionOutcome.body;
   const sessionSnapshot =
     body.session || browserSessionManager.buildSnapshot();
@@ -665,7 +771,7 @@ export async function dispatchGeminiToolCall(
     };
   } else if (body.result) {
     boundedResultForModel = body.result as unknown as Record<string, unknown>;
-    if (validName === 'navigate_browser') {
+    if (validName === 'navigate_browser' || validName === 'start_browser') {
       conciseOutcomeSummary = `Navigated to ${body.currentUrl} ("${body.pageTitle}").`;
     } else if (validName === 'click_element') {
       conciseOutcomeSummary = `Clicked target element on "${body.pageTitle}".`;
